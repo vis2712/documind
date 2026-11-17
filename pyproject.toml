@@ -11,7 +11,40 @@ dependencies = [
     "numpy>=2.0",
     "openai>=1.50",
     "pypdf>=5.0",
+    "pyjwt>=2.15.1",
+    "pwdlib[argon2]>=0.4.0",
+    "pypdfium2>=5.15.2",
+    "pytesseract>=0.3.13",
+    "pillow>=13.0.0",
+    "fastembed>=0.9.1",
+    "rq>=3.0.0",
+    "redis>=8.1.0",
+    "boto3>=1.44.3",
+    "langfuse>=5.2.0",
 ]
 
 [dependency-groups]
-dev = ["pytest>=8.3"]
+dev = [
+    "moto>=5.2.5",
+    "pytest>=8.3",
+    "reportlab>=5.1.0",
+    "ruff>=0.17.5",
+]
+ui = [
+    "httpx>=0.28.1",
+    "streamlit>=1.67.0",
+]
+
+[tool.uv]
+default-groups = ["dev", "ui"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC"]
+ignore = ["B008"]  # FastAPI's Depends() in defaults is idiomatic
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

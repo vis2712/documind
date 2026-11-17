@@ -16,7 +16,7 @@ def test_chunks_respect_size():
 def test_chunks_overlap():
     text = " ".join(f"w{i}" for i in range(500))
     chunks = chunk_text(text, size=200, overlap=40)
-    for a, b in zip(chunks, chunks[1:]):
+    for a, b in zip(chunks, chunks[1:], strict=False):
         assert a.split()[-1] in b.split()  # last word of a chunk reappears at the start of the next
 
 

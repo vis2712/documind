@@ -1,64 +1,176 @@
 # DocuMind
 
-Upload PDFs, ask questions, and get streamed answers with page-level citations.
-FastAPI + PostgreSQL/pgvector, hybrid search (vectors + full-text, fused with RRF), multi-tenant.
+**Chat with your documents.** Upload PDFs, scans or photos of invoices, ask questions in plain English, and get
+streamed answers with page-level citations, or an honest "I don't know".
 
-## Architecture (v0.1, local)
+FastAPI · PostgreSQL + pgvector · hybrid search + cross-encoder reranking · OCR · Redis/RQ workers · JWT auth ·
+Streamlit · LLM evals · Langfuse tracing · Docker · GitHub Actions
+
+<!-- After deploying, add: Live demo link · 2-minute demo video link · screenshot of the UI -->
+
+## Features
+
+- **Grounded answers with citations.** Every claim is tagged `[S1]`, `[S2]` and linked to a file and page.
+  Answers that cite sources which weren't retrieved are flagged.
+- **Hybrid retrieval.** pgvector cosine search and Postgres full-text search are fused with Reciprocal Rank
+  Fusion, then reranked by a local cross-encoder (ONNX on CPU, no API cost).
+- **OCR.** Scanned PDF pages and PNG/JPG uploads are read with Tesseract or a vision LLM.
+- **Background ingestion.** Uploads return `202` at once; a Redis/RQ worker extracts, chunks and embeds, with
+  3 retries and backoff. Re-running a job is safe (chunks are replaced in one transaction).
+- **Conversations.** Follow-ups like "and for managers?" are rewritten into standalone search queries using
+  the chat history.
+- **Multi-tenant.** JWT auth (Argon2id password hashes), and every query is scoped to the signed-in user.
+- **Observability.** Latency, time to first token, tokens and cost are stored per answer, with a usage
+  dashboard (avg and p95 latency, total cost). Optional Langfuse traces of every step.
+- **Evals.** 34-question test set over a sample corpus: hit@k, MRR, LLM-judged correctness and faithfulness,
+  refusal accuracy on unanswerable questions, latency and cost.
+
+## Architecture
 
 ```
-POST /documents ──► save PDF ──► 202 Accepted
-                         └─► background task: pypdf (per page) → chunk (1000 chars, 150 overlap)
-                                               → embed (batch) → INSERT chunks (+ tsvector)
-POST /chat ──► embed question ─┬─► pgvector cosine top-30 ─┐
-                               └─► Postgres full-text top-30 ┴─► RRF fusion → top-5 → LLM → SSE stream
+                      ┌────────────── Streamlit UI (:8501) ──────────────┐
+                      │ login · upload · documents · chat · usage        │
+                      └──────────────────────┬───────────────────────────┘
+                                             │ HTTP + SSE, Bearer JWT
+┌────────────────────────────────── FastAPI (:8000) ───────────────────────────────────┐
+│ /auth   register, login (OAuth2 password flow) → JWT                                 │
+│ /documents  upload → storage (disk/S3) → enqueue ──────────────► Redis ──► RQ worker │
+│ /chat   history → rewrite follow-up → hybrid search → rerank → LLM → SSE stream      │
+│ /conversations · /stats                                                              │
+└─────────────┬──────────────────────────────────────────────────────────────┬─────────┘
+              │                                                              │
+   PostgreSQL 17 + pgvector                                    Worker: read file
+   users · documents · chunks (vector + tsvector)              → text layer, or OCR for scans
+   conversations · messages (sources, usage)                   → chunk (1000 chars, 150 overlap)
+                                                               → embed (batched) → chunks table
 ```
-Every query filters by `owner_id`, so users only search their own documents.
+
+**Query pipeline**
+
+```
+question ─► rewrite with history ─► embed ─┬─► pgvector cosine, top 30 ───┐
+                                           └─► full-text search, top 30 ──┴─► RRF fusion, top 20
+          ─► cross-encoder rerank, top 5 ─► grounded prompt ─► LLM stream ─► citation check ─► save + usage
+```
 
 ## Run locally
 
-Prereqs: Docker Desktop and [uv](https://docs.astral.sh/uv/).
+**Prerequisites:** Docker Desktop and [uv](https://docs.astral.sh/uv/). You also need an LLM key; Gemini's
+free tier works (<https://aistudio.google.com/apikey>), or set `LLM_PROVIDER=fake` to run with no key.
 
 ```bash
-cp .env.example .env               # add your Gemini key (free tier) or use LLM_PROVIDER=fake
-docker compose up -d --wait        # Postgres + pgvector on localhost:5433
-uv sync                            # create .venv and install deps
-uv run pytest -q                   # unit tests
-uv run fastapi dev app/main.py     # http://localhost:8000/docs (auto-reload)
+cp .env.example .env     # set LLM_API_KEY and JWT_SECRET
 ```
 
-Try it:
+**Option A: everything in Docker** (closest to production)
 ```bash
-curl -H 'X-User-Id: vishal' -F file=@some.pdf localhost:8000/documents
-curl -H 'X-User-Id: vishal' localhost:8000/documents          # wait until status = ready
-curl -N -H 'X-User-Id: vishal' -H 'Content-Type: application/json' \
-     -d '{"question":"What are the payment terms?"}' localhost:8000/chat
+docker compose up -d --build
+open http://localhost:8501          # UI      (API docs: http://localhost:8000/docs)
+docker compose logs -f api worker   # watch ingestion and per-answer latency/cost
 ```
 
-`/chat` streams Server-Sent Events: `sources` (citations), many `token` events, then `done`.
+**Option B: develop with hot reload** (infrastructure in Docker, Python processes local)
+```bash
+docker compose up -d db redis
+uv sync
+uv run fastapi dev app/main.py                 # terminal 1: API on :8000
+uv run python -m app.worker                    # terminal 2: ingestion worker
+uv run streamlit run ui/streamlit_app.py       # terminal 3: UI on :8501
+```
+On macOS, install Tesseract for local OCR (`brew install tesseract`), or set `OCR_ENGINE=llm` to use the
+vision model. The Docker image already includes it.
 
-**Changing the embedding model or `EMBED_DIM`** changes the vector column size. Reset the DB with
-`docker compose down -v && docker compose up -d --wait`.
+**Tests and lint**
+```bash
+uv run pytest -q          # 34 tests; uses a separate documind_test database, no API calls
+uv run ruff check . && uv run ruff format --check .
+```
 
-## Code map
+## Evaluation
 
-| File | What it does |
+```bash
+uv run python -m evals.make_corpus   # sample handbook, invoice and a scanned notice
+uv run python -m evals.run           # writes evals/results/latest.md
+```
+
+| Metric | What it measures |
 |---|---|
-| `app/config.py` | Settings from `.env` (pydantic-settings) |
-| `app/db.py` | Schema (documents, chunks, HNSW + GIN indexes), connection pool |
-| `app/ingest.py` | PDF text per page, recursive chunker, background ingestion |
-| `app/retrieval.py` | Hybrid search SQL with Reciprocal Rank Fusion |
-| `app/llm.py` | Embeddings and streaming chat over any OpenAI-compatible API; grounded prompt |
-| `app/main.py` | FastAPI routes |
+| hit@1, hit@5, MRR | Retrieval: is the correct file and page in the top results |
+| correctness | LLM judge: does the answer contain the reference facts |
+| faithfulness | LLM judge: is every claim supported by the retrieved sources (no hallucination) |
+| refusal accuracy | Says "I don't know" on 4 questions the documents can't answer |
+| citation rate, invalid citations | Answers cite their sources, and only sources that exist |
+| p50/p95 latency, cost | Speed and price per question |
+
+<!-- Paste the summary table from evals/results/latest.md here after your first run. -->
+
+Use `--judge-model` to judge with a stronger model than the one being judged, `--no-judge` for a cheap
+retrieval-only run, and change one setting at a time (`RERANKER=none`, `TOP_K=3`, `CHUNK_SIZE=600`) to see what
+each part contributes.
+
+## API
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/auth/register` | Create an account (`email`, `password` ≥ 8 chars) |
+| POST | `/auth/login` | Form fields `username`, `password` → `access_token` |
+| GET | `/auth/me` | Current user |
+| POST | `/documents` | Upload PDF/PNG/JPG (multipart `file`) → `202`, ingestion queued |
+| GET | `/documents` · `/documents/{id}` | List / status (`queued`, `processing`, `ready`, `failed`) |
+| GET | `/documents/{id}/file` | Download the original file |
+| POST | `/documents/{id}/reprocess` | Re-run ingestion |
+| DELETE | `/documents/{id}` | Delete the document, its chunks and its file |
+| POST | `/chat` | `{question, conversation_id?, document_ids?}` → SSE: `meta`, `sources`, `token`…, `done` |
+| GET/DELETE | `/conversations` · `/conversations/{id}` | Chat history with sources and usage |
+| GET | `/stats` | Documents, answers, tokens, cost, avg and p95 latency |
+
+Interactive docs at `/docs`. Click **Authorize** and sign in to try the protected routes.
+
+## Design decisions
+
+- **Postgres for vectors, keywords and app data.** One database, transactional re-ingestion, tenant filtering
+  in the same query as the vector search. A dedicated vector DB only pays off at much larger scale.
+- **Hybrid search and RRF.** Embeddings miss exact tokens such as invoice numbers and GSTINs; full-text search
+  misses paraphrases. RRF combines rankings without having to calibrate two different score scales.
+- **Rerank only the top 20.** A cross-encoder is much more accurate but too slow to run on every chunk.
+- **Per-page chunking.** Chunks never span pages, so every citation points at one exact page.
+- **The prompt treats document text as data.** Sources go inside `<sources>` tags with an instruction to
+  ignore instructions found in them; a basic defence against prompt injection from uploaded files.
+- **A provider-agnostic LLM layer.** Any OpenAI-compatible API (Gemini, OpenAI, Ollama). Models are config,
+  not code.
+
+## Project layout
+
+| Path | What it does |
+|---|---|
+| `app/main.py` | App setup, startup checks, `/health` |
+| `app/auth.py` | Register, login, JWT issue and verify, `current_user` dependency |
+| `app/routers/documents.py` | Upload (type detection by file bytes), list, download, reprocess, delete |
+| `app/routers/chat.py` | SSE chat, conversation memory, usage tracking, `/conversations`, `/stats` |
+| `app/ingest.py` | Text extraction, OCR fallback, recursive chunker, idempotent ingestion |
+| `app/ocr.py` | Tesseract or vision-LLM OCR |
+| `app/retrieval.py` | Hybrid search SQL with RRF, then rerank |
+| `app/rerank.py` | Local cross-encoder (fastembed / ONNX) |
+| `app/llm.py` | Embeddings, streaming answers, follow-up rewriting, vision OCR |
+| `app/jobs.py`, `app/worker.py` | Enqueueing and the RQ worker with retries |
+| `app/storage.py` | Local disk or S3 |
+| `app/observability.py` | Optional Langfuse tracing |
+| `ui/streamlit_app.py` | Web UI |
+| `evals/` | Corpus generator, dataset, eval runner with LLM judge |
+| `docs/DEPLOY_AWS.md` | Deploying to AWS (single EC2, or ECS + RDS + S3) |
 
 ## Roadmap
 
-- [x] Upload, background ingestion, pgvector, hybrid search, streamed answers with citations, tenant isolation
-- [ ] JWT auth instead of the `X-User-Id` header
-- [ ] OCR for scanned PDFs (Tesseract / a vision LLM)
-- [ ] Reranking (bge-reranker or Cohere) over the fused top 30
-- [ ] Real job queue (RQ/Celery + Redis) with retries instead of FastAPI BackgroundTasks
-- [ ] Conversation memory (follow-up questions)
-- [ ] UI (Streamlit or Next.js)
-- [ ] Evals: 30–50 Q&A pairs, RAGAS faithfulness / answer relevance
-- [ ] Tracing with Langfuse (latency, tokens, cost per request)
-- [ ] Dockerfile, deploy to AWS (ECS + RDS + S3), GitHub Actions CI, demo video
+- [x] Ingestion, pgvector, hybrid search, streamed answers with citations, tenant isolation
+- [x] JWT auth
+- [x] OCR for scanned PDFs and images
+- [x] Cross-encoder reranking
+- [x] Redis/RQ job queue with retries
+- [x] Conversation memory with follow-up rewriting
+- [x] Streamlit UI with a usage dashboard
+- [x] Evals (retrieval metrics + LLM judge)
+- [x] Tracing (Langfuse) and per-answer latency, tokens and cost
+- [x] Docker, docker compose, GitHub Actions CI, AWS deploy guide
+- [ ] Deploy and record the demo video
+- [ ] Semantic cache for repeated questions (Redis)
+- [ ] PII masking before text is sent to the LLM

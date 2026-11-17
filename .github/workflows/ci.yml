@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: documind
+          POSTGRES_PASSWORD: documind
+          POSTGRES_DB: documind
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U documind" --health-interval 3s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Cache reranker model
+        uses: actions/cache@v4
+        with:
+          path: data/models
+          key: models-${{ hashFiles('app/config.py') }}
+      - run: uv sync --frozen
+      - name: Lint
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+      - name: Tests
+        run: uv run pytest -q
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build API/worker image
+        run: docker build -t documind-api .
+      - name: Build UI image
+        run: docker build -f ui/Dockerfile -t documind-ui .

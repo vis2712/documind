@@ -1,3 +1,24 @@
+# Local development:  docker compose up -d db redis   (then run the API, worker and UI with uv)
+# Full stack:         docker compose up -d --build     (http://localhost:8501 for the UI)
+
+x-app: &app
+  build: .
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    DATABASE_URL: postgresql://documind:documind@db:5432/documind
+    REDIS_URL: redis://redis:6379/0
+    UPLOAD_DIR: /app/data/uploads
+  volumes:
+    - uploads:/app/data/uploads # the API writes files here and the worker reads them
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+
 services:
   db:
     image: pgvector/pgvector:pg17
@@ -14,5 +35,38 @@ services:
       interval: 3s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      retries: 10
+
+  api:
+    <<: *app
+    ports:
+      - "8000:8000"
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "app.worker"]
+    healthcheck:
+      disable: true
+
+  ui:
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
+    environment:
+      API_URL: http://api:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+    restart: unless-stopped
+
 volumes:
   pgdata:
+  uploads:

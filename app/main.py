@@ -1,127 +1,54 @@
-import json
+import asyncio
 import logging
 from contextlib import asynccontextmanager
-from pathlib import Path
-from uuid import UUID
 
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi import FastAPI
 
+from app.auth import router as auth_router
 from app.config import settings
 from app.db import close_db, get_pool, init_db
-from app.ingest import ingest_document
-from app.llm import NO_ANSWER, stream_answer
-from app.retrieval import hybrid_search
+from app.jobs import check_queue
+from app.observability import ENABLED as TRACING
+from app.observability import flush
+from app.ocr import resolve_engine
+from app.rerank import warm_up
+from app.routers.chat import router as chat_router
+from app.routers.documents import router as documents_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("app")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
+    if len(settings.jwt_secret) < 32:
+        raise RuntimeError("JWT_SECRET must be set in .env (32+ chars). See .env.example.")
     await init_db()
+    await asyncio.to_thread(check_queue)
+    await asyncio.to_thread(warm_up)
+    log.info(
+        "DocuMind ready: llm=%s chat_model=%s queue=%s storage=%s ocr=%s reranker=%s tracing=%s",
+        settings.llm_provider,
+        settings.chat_model,
+        settings.queue_backend,
+        settings.storage_backend,
+        resolve_engine(),
+        settings.reranker,
+        TRACING,
+    )
     yield
     await close_db()
+    await asyncio.to_thread(flush)  # send any buffered traces before exiting
 
 
-app = FastAPI(title="DocuMind", description="Chat with your documents", lifespan=lifespan)
+app = FastAPI(title="DocuMind", description="Chat with your documents, with citations", lifespan=lifespan)
+app.include_router(auth_router)
+app.include_router(documents_router)
+app.include_router(chat_router)
 
 
-def current_user(x_user_id: str = Header(min_length=1, max_length=64)) -> str:
-    """TEMPORARY auth: trust an X-User-Id header. Replace with JWT verification (next milestone)."""
-    return x_user_id
-
-
-class ChatRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=2000)
-
-
-DOC_COLUMNS = "id, filename, status, error, num_pages, num_chunks, created_at"
-
-
-@app.get("/health")
+@app.get("/health", tags=["ops"])
 async def health():
+    async with get_pool().connection() as conn:
+        await conn.execute("SELECT 1")
     return {"status": "ok"}
-
-
-@app.post("/documents", status_code=202)
-async def upload_document(file: UploadFile, background: BackgroundTasks, user: str = Depends(current_user)):
-    if not (file.filename or "").lower().endswith(".pdf"):
-        raise HTTPException(400, "Only PDF files are supported for now")
-    data = await file.read()
-    if len(data) > settings.max_upload_mb * 1024 * 1024:
-        raise HTTPException(413, f"File larger than {settings.max_upload_mb} MB")
-
-    async with get_pool().connection() as conn:
-        cur = await conn.execute(
-            f"INSERT INTO documents (owner_id, filename) VALUES (%s, %s) RETURNING {DOC_COLUMNS}",
-            (user, file.filename),
-        )
-        doc = await cur.fetchone()
-
-    path = Path(settings.upload_dir) / f"{doc['id']}.pdf"
-    path.write_bytes(data)
-    # Returns 202 immediately; ingestion continues after the response is sent.
-    background.add_task(ingest_document, doc["id"], user, str(path))
-    return doc
-
-
-@app.get("/documents")
-async def list_documents(user: str = Depends(current_user)):
-    async with get_pool().connection() as conn:
-        cur = await conn.execute(
-            f"SELECT {DOC_COLUMNS} FROM documents WHERE owner_id = %s ORDER BY created_at DESC", (user,)
-        )
-        return await cur.fetchall()
-
-
-@app.get("/documents/{doc_id}")
-async def get_document(doc_id: UUID, user: str = Depends(current_user)):
-    async with get_pool().connection() as conn:
-        cur = await conn.execute(
-            f"SELECT {DOC_COLUMNS} FROM documents WHERE id = %s AND owner_id = %s", (doc_id, user)
-        )
-        doc = await cur.fetchone()
-    if not doc:
-        raise HTTPException(404, "Document not found")  # 404 (not 403) so other users' IDs aren't revealed
-    return doc
-
-
-@app.delete("/documents/{doc_id}", status_code=204)
-async def delete_document(doc_id: UUID, user: str = Depends(current_user)):
-    async with get_pool().connection() as conn:
-        cur = await conn.execute("DELETE FROM documents WHERE id = %s AND owner_id = %s", (doc_id, user))
-    if cur.rowcount == 0:
-        raise HTTPException(404, "Document not found")
-    (Path(settings.upload_dir) / f"{doc_id}.pdf").unlink(missing_ok=True)
-
-
-def sse(event: str, data) -> str:
-    return f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
-
-
-@app.post("/chat")
-async def chat(req: ChatRequest, user: str = Depends(current_user)):
-    """Streams Server-Sent Events: one `sources` event, many `token` events, then `done`."""
-    chunks = await hybrid_search(user, req.question)
-
-    async def events():
-        sources = [
-            {"tag": f"S{i}", "document_id": c["document_id"], "filename": c["filename"],
-             "page": c["page"], "score": round(float(c["score"]), 4), "preview": c["content"][:200]}
-            for i, c in enumerate(chunks, 1)
-        ]
-        yield sse("sources", sources)
-        if not chunks:
-            yield sse("token", NO_ANSWER)
-        else:
-            try:
-                async for token in stream_answer(req.question, chunks):
-                    yield sse("token", token)
-            except Exception as e:
-                logging.exception("LLM call failed")
-                yield sse("error", str(e)[:300])
-        yield sse("done", {})
-
-    return StreamingResponse(events(), media_type="text/event-stream")
